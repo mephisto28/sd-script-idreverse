@@ -165,6 +165,8 @@ def train(args):
     weight_dtype, save_dtype = train_util.prepare_dtype(args)
 
     # モデルを読み込む
+    from networks.mlp import ResMlp
+    id_mlp = ResMlp(num_layers=args.id_mlp_layers, num_hidden_states=768)
     text_encoder, vae, unet, _ = train_util.load_target_model(args, weight_dtype, accelerator)
 
     # モデルに xformers とか memory efficient attention を組み込む
@@ -258,7 +260,8 @@ def train(args):
             "Deprecated: use prepare_optimizer_params(text_encoder_lr, unet_lr, learning_rate) instead of prepare_optimizer_params(text_encoder_lr, unet_lr)"
         )
         trainable_params = network.prepare_optimizer_params(args.text_encoder_lr, args.unet_lr)
-
+    import itertools
+    trainable_params = itertools.chain(trainable_params, [{"params": id_mlp.parameters(), "lr": args.id_lr}])
     optimizer_name, optimizer_args, optimizer = train_util.get_optimizer(args, trainable_params)
 
     # dataloaderを準備する
@@ -298,27 +301,29 @@ def train(args):
 
     # acceleratorがなんかよろしくやってくれるらしい
     if train_unet and train_text_encoder:
-        unet, text_encoder, network, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            unet, text_encoder, network, optimizer, train_dataloader, lr_scheduler
+        unet, text_encoder, network, id_mlp, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            unet, text_encoder, network, id_mlp, optimizer, train_dataloader, lr_scheduler
         )
     elif train_unet:
-        unet, network, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            unet, network, optimizer, train_dataloader, lr_scheduler
+        unet, network, id_mlp, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            unet, network, id_mlp, optimizer, train_dataloader, lr_scheduler
         )
     elif train_text_encoder:
-        text_encoder, network, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            text_encoder, network, optimizer, train_dataloader, lr_scheduler
+        text_encoder, network, id_mlp, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            text_encoder, network, id_mlp, optimizer, train_dataloader, lr_scheduler
         )
     else:
         network, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(network, optimizer, train_dataloader, lr_scheduler)
 
     # transform DDP after prepare (train_network here only)
-    text_encoder, unet, network = train_util.transform_if_model_is_DDP(text_encoder, unet, network)
+    text_encoder, unet, network, id_mlp = train_util.transform_if_model_is_DDP(text_encoder, unet, network, id_mlp)
 
     unet.requires_grad_(False)
+    id_mlp.requires_grad_(True)
     unet.to(accelerator.device, dtype=weight_dtype)
     text_encoder.requires_grad_(False)
     text_encoder.to(accelerator.device)
+    id_mlp.to(accelerator.device)
     if args.gradient_checkpointing:  # according to TI example in Diffusers, train is required
         unet.train()
         text_encoder.train()
@@ -615,6 +620,11 @@ def train(args):
         network.on_epoch_start(text_encoder, unet)
 
         for step, batch in enumerate(train_dataloader):
+            if step == 0:
+                train_util.sample_images(
+                    accelerator, args, None, global_step, accelerator.device, vae, tokenizer, text_encoder, unet, id_mlp=id_mlp
+                )
+            # print(list(batch.keys()), batch['id_features'].shape)
             current_step.value = global_step
             with accelerator.accumulate(network):
                 on_step_start(text_encoder, unet)
@@ -631,6 +641,7 @@ def train(args):
                 with torch.set_grad_enabled(train_text_encoder):
                     # Get the text embedding for conditioning
                     if args.weighted_captions:
+                        print("weighted caption")
                         encoder_hidden_states = get_weighted_text_embeddings(
                             tokenizer,
                             text_encoder,
@@ -642,6 +653,11 @@ def train(args):
                     else:
                         input_ids = batch["input_ids"].to(accelerator.device)
                         encoder_hidden_states = train_util.get_hidden_states(args, input_ids, tokenizer, text_encoder, weight_dtype)
+                        with torch.set_grad_enabled(True):
+                            encoder_id_features = id_mlp(batch['id_features'].to(accelerator.device))
+                            encoder_hidden_states = torch.cat([encoder_id_features[:, None, :], encoder_hidden_states], dim=1)
+                        # print("id:", encoder_id_features.norm(dim=-1, p=2))
+                        # print("prompt:", encoder_hidden_states.norm(dim=-1, p=2))
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents, device=latents.device)
@@ -688,6 +704,7 @@ def train(args):
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+                # time.sleep(0.2)
 
             if args.scale_weight_norms:
                 keys_scaled, mean_norm, maximum_norm = network.apply_max_norm_regularization(
@@ -700,10 +717,11 @@ def train(args):
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 progress_bar.update(1)
+                # print(id_mlp.out.weight[:5, :5])
                 global_step += 1
 
                 train_util.sample_images(
-                    accelerator, args, None, global_step, accelerator.device, vae, tokenizer, text_encoder, unet
+                    accelerator, args, None, global_step, accelerator.device, vae, tokenizer, text_encoder, unet, id_mlp=id_mlp
                 )
 
                 # 指定ステップごとにモデルを保存
@@ -712,6 +730,9 @@ def train(args):
                     if accelerator.is_main_process:
                         ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, global_step)
                         save_model(ckpt_name, unwrap_model(network), global_step, epoch)
+                        id_mlp_ckpt_path = os.path.join(args.output_dir, ckpt_name) + '_mlp.pt'
+                        print("save:", id_mlp_ckpt_path)
+                        torch.save(unwrap_model(id_mlp), id_mlp_ckpt_path)
 
                         if args.save_state:
                             train_util.save_and_remove_state_stepwise(args, accelerator, global_step)
@@ -754,7 +775,10 @@ def train(args):
             if is_main_process and saving:
                 ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, epoch + 1)
                 save_model(ckpt_name, unwrap_model(network), global_step, epoch + 1)
-
+                id_mlp_ckpt_path = os.path.join(args.output_dir, ckpt_name) + '_mlp.pt'
+                print("save:", id_mlp_ckpt_path)
+                torch.save(unwrap_model(id_mlp), id_mlp_ckpt_path)
+                
                 remove_epoch_no = train_util.get_remove_epoch_no(args, epoch + 1)
                 if remove_epoch_no is not None:
                     remove_ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, remove_epoch_no)
@@ -805,7 +829,8 @@ def setup_parser() -> argparse.ArgumentParser:
         choices=[None, "ckpt", "pt", "safetensors"],
         help="format to save the model (default is .safetensors) / モデル保存時の形式（デフォルトはsafetensors）",
     )
-
+    parser.add_argument("--id_mlp_layers", type=int, default=3, help="learning rate for Id_mlp / Id mlp の学習率")
+    parser.add_argument("--id_lr", type=float, default=None, help="learning rate for Id_mlp / Id mlp の学習率")
     parser.add_argument("--unet_lr", type=float, default=None, help="learning rate for U-Net / U-Netの学習率")
     parser.add_argument("--text_encoder_lr", type=float, default=None, help="learning rate for Text Encoder / Text Encoderの学習率")
 

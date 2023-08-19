@@ -909,7 +909,7 @@ def load_models_from_stable_diffusion_checkpoint(v2, ckpt_path, device="cpu", dt
         text_model = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14").to(device)
         logging.set_verbosity_warning()
 
-        info = text_model.load_state_dict(converted_text_encoder_checkpoint)
+        info = text_model.load_state_dict(converted_text_encoder_checkpoint, strict=False)
     print("loading text encoder:", info)
 
     return text_model, vae, unet

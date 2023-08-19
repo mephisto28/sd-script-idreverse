@@ -64,6 +64,10 @@ from library.lpw_stable_diffusion import StableDiffusionLongPromptWeightingPipel
 import library.model_util as model_util
 import library.huggingface_util as huggingface_util
 
+from sbp.io import SequenceFileReader
+from sbp.io.common.encoder_decoder import decode_b64
+from sbp.utils.parallel import parallel_imap
+
 # Tokenizer: checkpointから読み込むのではなくあらかじめ提供されているものを使う
 TOKENIZER_PATH = "openai/clip-vit-large-patch14"
 V2_STABLE_DIFFUSION_PATH = "stabilityai/stable-diffusion-2"  # ここからtokenizerだけ使う v2とv2.1はtokenizer仕様は同じ
@@ -85,9 +89,15 @@ STEP_DIFFUSERS_DIR_NAME = "{}-step{:08d}"
 
 IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".PNG", ".JPG", ".JPEG", ".WEBP", ".BMP"]
 
+def decode_feature(s):
+    obj = json.loads(s)
+    if len(obj) == 0:
+        return np.zeros(512, dtype=np.float16)
+    else:
+        return decode_b64(obj[0]['embedding'].encode())  
 
 class ImageInfo:
-    def __init__(self, image_key: str, num_repeats: int, caption: str, is_reg: bool, absolute_path: str) -> None:
+    def __init__(self, image_key: str, num_repeats: int, caption: str, is_reg: bool, absolute_path: str, extra_feature=None) -> None:
         self.image_key: str = image_key
         self.num_repeats: int = num_repeats
         self.caption: str = caption
@@ -100,6 +110,7 @@ class ImageInfo:
         self.latents_flipped: torch.Tensor = None
         self.latents_npz: str = None
         self.latents_npz_flipped: str = None
+        self.extra_feature = extra_feature
 
 
 class BucketManager:
@@ -913,6 +924,7 @@ class BaseDataset(torch.utils.data.Dataset):
         input_ids_list = []
         latents_list = []
         images = []
+        id_features = []
 
         for image_key in bucket[image_index : image_index + bucket_batch_size]:
             image_info = self.image_data[image_key]
@@ -961,6 +973,7 @@ class BaseDataset(torch.utils.data.Dataset):
                 latents = None
                 image = self.image_transforms(img)  # -1.0~1.0のtorch.Tensorになる
 
+            id_features.append(image_info.extra_feature)
             images.append(image)
             latents_list.append(latents)
 
@@ -984,6 +997,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
         example = {}
         example["loss_weights"] = torch.FloatTensor(loss_weights)
+        example['id_features'] = torch.FloatTensor(np.array(id_features))
 
         if self.token_padding_disabled:
             # padding=True means pad in the batch
@@ -1031,7 +1045,7 @@ class DreamBoothDataset(BaseDataset):
         self.size = min(self.width, self.height)  # 短いほう
         self.prior_loss_weight = prior_loss_weight
         self.latents_cache = None
-
+        self.caption_dict = {}
         self.enable_bucket = enable_bucket
         if self.enable_bucket:
             assert (
@@ -1081,23 +1095,55 @@ class DreamBoothDataset(BaseDataset):
             img_paths = glob_images(subset.image_dir, "*")
             print(f"found directory {subset.image_dir} contains {len(img_paths)} image files")
 
+            if len(self.caption_dict) == 0:
+                print("loading caption dict")
+                caption_path = os.path.join(subset.image_dir, '../image_captions.list')
+                caption_dict = {}
+                with open(caption_path) as f:
+                    for line in f:
+                        a, b = line.split('\t', maxsplit=1)
+                        caption_dict[a] = b
+                self.caption_dict = caption_dict
+                self.class2caption = {
+                    '虞书欣': 'yushuxing',
+                    '倪妮': 'nini',
+                    '万茜': 'wanqian',
+                    '刘耀文': 'liuyaowen',
+                    '娄艺潇': 'louyixiao',
+                    '孟美岐': 'mengmeiqi',
+                    '张国荣': 'zhangguorong',
+                    '李斯丹妮': 'lisidanni',
+                    '李荣浩': 'lironghao',
+                    '王子文': 'wangziwen',
+                    '王祖贤': 'wangzuxian',
+                    '谢霆锋': 'xietingfeng',
+                    '马嘉祺': 'majiaqi',
+                    '刘雨昕': 'liuyuxin'
+                }
+            else:
+                caption_dict = self.caption_dict
             # 画像ファイルごとにプロンプトを読み込み、もしあればそちらを使う
             captions = []
             missing_captions = []
             for img_path in img_paths:
                 cap_for_img = read_caption(img_path, subset.caption_extension)
-                if cap_for_img is None and subset.class_tokens is None:
-                    print(
-                        f"neither caption file nor class tokens are found. use empty caption for {img_path} / キャプションファイルもclass tokenも見つかりませんでした。空のキャプションを使用します: {img_path}"
-                    )
-                    captions.append("")
+                # if cap_for_img is None and subset.class_tokens is None:
+                #     print(
+                #         f"neither caption file nor class tokens are found. use empty caption for {img_path} / キャプションファイルもclass tokenも見つかりませんでした。空のキャプションを使用します: {img_path}"
+                #     )
+                #     captions.append("")
+                #     missing_captions.append(img_path)
+                # else:
+                key = '/'.join(img_path.split('/')[-2:])
+                # cap_for_img = self.class2caption[subset.class_tokens] + ', ' + caption_dict[key]
+                cap_for_img = caption_dict[key]
+                if cap_for_img is None:
+                    captions.append(subset.class_tokens)
                     missing_captions.append(img_path)
                 else:
-                    if cap_for_img is None:
-                        captions.append(subset.class_tokens)
-                        missing_captions.append(img_path)
-                    else:
-                        captions.append(cap_for_img)
+                    captions.append(cap_for_img)
+            if len(captions) > 0:
+                print(img_path, cap_for_img)
 
             self.set_tag_frequency(os.path.basename(subset.image_dir), captions)  # タグ頻度を記録
 
@@ -1120,6 +1166,13 @@ class DreamBoothDataset(BaseDataset):
         num_train_images = 0
         num_reg_images = 0
         reg_infos: List[ImageInfo] = []
+
+        id_features = {}
+        ssf = SequenceFileReader(os.path.join(subsets[0].image_dir, '../result.list'))
+        for k, id_feature in zip(ssf.keys, parallel_imap(decode_feature, (ssf.read(k) for k in ssf.keys))):
+            k = '/'.join(k.split('/')[-3:]).replace('/已裁剪', '')
+            id_features[k] = id_feature
+
         for subset in subsets:
             if subset.num_repeats < 1:
                 print(
@@ -1144,11 +1197,13 @@ class DreamBoothDataset(BaseDataset):
                 num_train_images += subset.num_repeats * len(img_paths)
 
             for img_path, caption in zip(img_paths, captions):
-                info = ImageInfo(img_path, subset.num_repeats, caption, subset.is_reg, img_path)
-                if subset.is_reg:
-                    reg_infos.append(info)
-                else:
-                    self.register_image(info, subset)
+                key = '/'.join(img_path.split('/')[-2:])
+                if key in id_features:
+                    info = ImageInfo(img_path, subset.num_repeats, caption, subset.is_reg, img_path, extra_feature=id_features[key])
+                    if subset.is_reg:
+                        reg_infos.append(info)
+                    else:
+                        self.register_image(info, subset)
 
             subset.img_count = len(img_paths)
             self.subsets.append(subset)
@@ -2099,6 +2154,7 @@ def add_optimizer_arguments(parser: argparse.ArgumentParser):
 def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: bool):
     parser.add_argument("--output_dir", type=str, default=None, help="directory to output trained model / 学習後のモデル出力先ディレクトリ")
     parser.add_argument("--output_name", type=str, default=None, help="base name of trained model file / 学習後のモデルの拡張子を除くファイル名")
+    parser.add_argument("--train_wo_name", default=False, action="store_true")
     parser.add_argument(
         "--huggingface_repo_id", type=str, default=None, help="huggingface repo name to upload / huggingfaceにアップロードするリポジトリ名"
     )
@@ -3042,6 +3098,7 @@ def load_tokenizer(args: argparse.Namespace):
         if args.v2:
             tokenizer = CLIPTokenizer.from_pretrained(original_path, subfolder="tokenizer")
         else:
+            print(original_path)
             tokenizer = CLIPTokenizer.from_pretrained(original_path)
 
     if hasattr(args, "max_token_length") and args.max_token_length is not None:
@@ -3086,7 +3143,7 @@ def prepare_accelerator(args: argparse.Namespace):
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=log_with,
-        logging_dir=logging_dir,
+        project_dir=logging_dir,
     )
 
     # accelerateの互換性問題を解決する
@@ -3130,6 +3187,11 @@ def _load_target_model(args: argparse.Namespace, weight_dtype, device="cpu"):
     if load_stable_diffusion_format:
         print(f"load StableDiffusion checkpoint: {name_or_path}")
         text_encoder, vae, unet = model_util.load_models_from_stable_diffusion_checkpoint(args.v2, name_or_path, device)
+        # pipe = StableDiffusionPipeline.from_single_file(name_or_path, tokenizer=None, load_safety_checker=None)
+        # text_encoder = pipe.text_encoder
+        # vae = pipe.vae
+        # unet = pipe.unet
+        # del pipe
     else:
         # Diffusers model is loaded to CPU
         print(f"load Diffusers pretrained models: {name_or_path}")
@@ -3152,9 +3214,9 @@ def _load_target_model(args: argparse.Namespace, weight_dtype, device="cpu"):
     return text_encoder, vae, unet, load_stable_diffusion_format
 
 
-def transform_if_model_is_DDP(text_encoder, unet, network=None):
+def transform_if_model_is_DDP(text_encoder, unet, network=None, id_map=None):
     # Transform text_encoder, unet and network from DistributedDataParallel
-    return (model.module if type(model) == DDP else model for model in [text_encoder, unet, network] if model is not None)
+    return (model.module if type(model) == DDP else model for model in [text_encoder, unet, network, id_map] if model is not None)
 
 
 def load_target_model(args, weight_dtype, accelerator):
@@ -3478,7 +3540,7 @@ SCHEDLER_SCHEDULE = "scaled_linear"
 
 
 def sample_images(
-    accelerator, args: argparse.Namespace, epoch, steps, device, vae, tokenizer, text_encoder, unet, prompt_replacement=None
+    accelerator, args: argparse.Namespace, epoch, steps, device, vae, tokenizer, text_encoder, unet, prompt_replacement=None, id_mlp=None
 ):
     """
     StableDiffusionLongPromptWeightingPipelineの改造版を使うようにしたので、clip skipおよびプロンプトの重みづけに対応した
@@ -3580,10 +3642,14 @@ def sample_images(
 
     rng_state = torch.get_rng_state()
     cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+    ssf = SequenceFileReader("/mnt/lg104/zwshi/data/character/stars/processed/result.list")
 
     with torch.no_grad():
         with accelerator.autocast():
             for i, prompt in enumerate(prompts):
+                k, prompt = prompt.split('\t', maxsplit=1)
+                f = torch.FloatTensor(decode_feature(ssf.read(k)))[None, ...]
+                f = id_mlp(f.to(device))
                 if not accelerator.is_main_process:
                     continue
 
@@ -3603,11 +3669,12 @@ def sample_images(
                     # subset of gen_img_diffusers
                     prompt_args = prompt.split(" --")
                     prompt = prompt_args[0]
-                    negative_prompt = None
+                    negative_prompt = 'paintings,sketches,(nsfw),(sexy),worst quality,low quality,normal quality, lowres, normal quality, ((monochrome)), ((grayscale)), skin spots, acnes, skin blemishes, age spot, glans, lowres,bad anatomy,bad hands, text, error, missing fingers,extra digit, fewer digits, cropped, worstquality, low quality, normal quality,jpegartifacts,signature, watermark, username,blurry,bad feet,cropped,poorly drawn hands,poorly drawn face,mutation,deformed,worst quality,low quality,normal quality,jpeg artifacts,watermark,extra fingers,fewer digits,extra limbs,extra arms,extra legs,malformed limbs,fused fingers,too many fingers,long neck,cross-eyed,mutated hands,polar lowres,bad body,bad proportions,gross proportions,text,error,missing fingers,missing arms,missing legs,extra digit'
                     sample_steps = 30
-                    width = height = 512
-                    scale = 7.5
-                    seed = None
+                    height = 768
+                    width = 512
+                    scale = 8
+                    seed = i
                     for parg in prompt_args:
                         try:
                             m = re.match(r"w (\d+)", parg, re.IGNORECASE)
@@ -3668,6 +3735,7 @@ def sample_images(
                     num_inference_steps=sample_steps,
                     guidance_scale=scale,
                     negative_prompt=negative_prompt,
+                    id_features=f
                 ).images[0]
 
                 ts_str = time.strftime("%Y%m%d%H%M%S", time.localtime())

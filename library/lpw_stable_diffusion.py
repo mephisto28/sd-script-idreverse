@@ -710,6 +710,7 @@ class StableDiffusionLongPromptWeightingPipeline(StableDiffusionPipeline):
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         is_cancelled_callback: Optional[Callable[[], bool]] = None,
         callback_steps: int = 1,
+        id_features = None,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -810,6 +811,9 @@ class StableDiffusionLongPromptWeightingPipeline(StableDiffusionPipeline):
             max_embeddings_multiples,
         )
         dtype = text_embeddings.dtype
+        if id_features is not None:
+            id_features = torch.cat([id_features for _ in range(text_embeddings.shape[0])], dim=0)
+            text_embeddings = torch.cat([id_features[:, None, :], text_embeddings], dim=1)
 
         # 4. Preprocess image and mask
         if isinstance(image, PIL.Image.Image):
