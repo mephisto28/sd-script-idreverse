@@ -444,10 +444,12 @@ def generate_dreambooth_subsets_config_by_subdirs(train_data_dir: Optional[str] 
     tokens = name.split('_')
     try:
       n_repeats = int(tokens[0])
+      caption_by_folder = '_'.join(tokens[1:])
     except ValueError as e:
       print(f"ignore directory without repeats / 繰り返し回数のないディレクトリを無視します: {name}")
-      return 0, ""
-    caption_by_folder = '_'.join(tokens[1:])
+      n_repeats = 1
+      caption_by_folder = '_'.join(tokens)
+      # return 0, ""
     return n_repeats, caption_by_folder
 
   def generate(base_dir: Optional[str], is_reg: bool):
