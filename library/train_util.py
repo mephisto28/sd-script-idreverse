@@ -29,6 +29,8 @@ import subprocess
 from io import BytesIO
 import toml
 
+import imagesize
+from sbp.utils.parallel import parallel_imap
 from tqdm import tqdm
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -65,8 +67,9 @@ import library.model_util as model_util
 import library.huggingface_util as huggingface_util
 
 from sbp.io import SequenceFileReader
-from sbp.io.common.encoder_decoder import decode_b64
+from sbp.io.common.encoder_decoder import decode_b64, decode_arrfp_b64
 from sbp.utils.parallel import parallel_imap
+from sbp.vision.protocal import ImageResult
 
 # Tokenizer: checkpointから読み込むのではなくあらかじめ提供されているものを使う
 TOKENIZER_PATH = "openai/clip-vit-large-patch14"
@@ -94,7 +97,58 @@ def decode_feature(s):
     if len(obj) == 0:
         return np.zeros(512, dtype=np.float16)
     else:
-        return decode_b64(obj[0]['embedding'].encode())  
+        return decode_b64(obj[0]['embedding'].encode())
+
+
+def decode_feature2(s):
+    encoded = json.loads(json.loads(s))['rec_feature_encoded']
+    return decode_arrfp_b64(encoded).astype(np.float32)
+    # print("obj type:", type(obj), obj)
+    result = ImageResult.from_json(obj)
+    face_results = result.get_detection('face', topk=1)
+    if len(face_results) == 0:
+        return np.zeros(512, dtype=np.float16)
+    else:
+        return face_results[0].rec_feature
+    # obj = json.loads(s)['detection_results']
+    # if len(obj) == 0:
+    #     return np.zeros(512, dtype=np.float16)
+    # else:
+    #     return np.array(obj[0]['rec_feature'])
+
+
+def get_sinusoidal_positional_encoding(position, dimension):
+    encoding = [0.0] * dimension
+    for i in range(dimension):
+        if i % 2 == 0:
+            encoding[i] = math.sin(position * (10000 ** (2*i / dimension)))
+        else:
+            encoding[i] = math.cos(position * (10000 ** ((2*i - 1) / dimension)))
+    return encoding
+
+
+def encode_pos_scale(bbox, h, w):
+    x1, y1, x2, y2 = bbox
+    x = (x1 + x2) / w / 2
+    y = (y1 + y2) / h / 2
+    s = (y2 - y1 + x2 - x2) / (w + h) * 2
+    x_enc = get_sinusoidal_positional_encoding(x, 64)
+    y_enc = get_sinusoidal_positional_encoding(y, 64)
+    s_enc = get_sinusoidal_positional_encoding(s, 64)
+    return np.array([x_enc, y_enc, s_enc]).flatten()
+
+
+def decode_feature_and_pos(s):
+    result = ImageResult.from_json(json.loads(s))
+    h, w = result.height, result.width
+    face_results = result.get_detection('face', topk=3)
+    results = np.zeros([3, 512+64*3], dtype=np.float32)
+    for i, face in enumerate(face_results):
+        pos_enc = encode_pos_scale(face.bbox, h, w)
+        face_feature = face.rec_feature
+        results[i] = np.concatenate([pos_enc, face_feature])
+    return results
+
 
 class ImageInfo:
     def __init__(self, image_key: str, num_repeats: int, caption: str, is_reg: bool, absolute_path: str, extra_feature=None) -> None:
@@ -316,6 +370,11 @@ class BaseSubset:
         self.token_warmup_step = token_warmup_step  # N（N<1ならN*max_train_steps）ステップ目でタグの数が最大になる
 
         self.img_count = 0
+
+
+class ConditionSubset(BaseSubset):
+    pass
+    
 
 
 class DreamBoothSubset(BaseSubset):
@@ -612,9 +671,10 @@ class BaseDataset(torch.utils.data.Dataset):
         min_size and max_size are ignored when enable_bucket is False
         """
         print("loading image sizes.")
-        for info in tqdm(self.image_data.values()):
-            if info.image_size is None:
-                info.image_size = self.get_image_size(info.absolute_path)
+        sizes = list(tqdm(parallel_imap(
+            self.get_image_size, (info.absolute_path for info in self.image_data.values()), num_thread=8)))
+        for info, size in zip(self.image_data.values(), sizes):
+            info.image_size = size
 
         if self.enable_bucket:
             print("make buckets")
@@ -770,8 +830,8 @@ class BaseDataset(torch.utils.data.Dataset):
             # check disk cache exists and size of latents
             if cache_to_disk:
                 # TODO: refactor to unify with FineTuningDataset
-                info.latents_npz = os.path.splitext(info.absolute_path)[0] + ".npz"
-                info.latents_npz_flipped = os.path.splitext(info.absolute_path)[0] + "_flip.npz"
+                info.latents_npz = (os.path.splitext(info.absolute_path)[0] + ".npz").replace('prossessed_v2/', 'prossessed_v2/latents/')
+                info.latents_npz_flipped = (os.path.splitext(info.absolute_path)[0] + "_flip.npz").replace('prossessed_v2/', 'prossessed_v2/latents/')
                 if not is_main_process:
                     continue
 
@@ -826,6 +886,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
             for info, latent in zip(batch, latents):
                 if cache_to_disk:
+                    os.makedirs(os.path.dirname(info.latents_npz), exist_ok=True)
                     np.savez(info.latents_npz, latent.float().numpy())
                 else:
                     info.latents = latent
@@ -835,13 +896,14 @@ class BaseDataset(torch.utils.data.Dataset):
                 latents = vae.encode(img_tensors).latent_dist.sample().to("cpu")
                 for info, latent in zip(batch, latents):
                     if cache_to_disk:
+                        os.makedirs(os.path.dirname(info.latents_npz_flipped), exist_ok=True)
                         np.savez(info.latents_npz_flipped, latent.float().numpy())
                     else:
                         info.latents_flipped = latent
 
     def get_image_size(self, image_path):
-        image = Image.open(image_path)
-        return image.size
+        # image = Image.open(image_path)
+        return imagesize.get(image_path)
 
     def load_image_with_face_info(self, subset: BaseSubset, image_path: str):
         img = self.load_image(image_path)
@@ -915,6 +977,7 @@ class BaseDataset(torch.utils.data.Dataset):
         return self._length
 
     def __getitem__(self, index):
+        from sbp.vision.transform import resize_longest, resize_shortest
         bucket = self.bucket_manager.buckets[self.buckets_indices[index].bucket_index]
         bucket_batch_size = self.buckets_indices[index].bucket_batch_size
         image_index = self.buckets_indices[index].batch_index * bucket_batch_size
@@ -942,28 +1005,38 @@ class BaseDataset(torch.utils.data.Dataset):
             else:
                 # 画像を読み込み、必要ならcropする
                 img, face_cx, face_cy, face_w, face_h = self.load_image_with_face_info(subset, image_info.absolute_path)
-                im_h, im_w = img.shape[0:2]
+                im_h, im_w = oh, ow = img.shape[0:2]
 
                 if self.enable_bucket:
                     img = self.trim_and_resize_if_required(subset, img, image_info.bucket_reso, image_info.resized_size)
                 else:
                     if face_cx > 0:  # 顔位置情報あり
                         img = self.crop_target(subset, img, face_cx, face_cy, face_w, face_h)
-                    elif im_h > self.height or im_w > self.width:
-                        assert (
-                            subset.random_crop
-                        ), f"image too large, but cropping and bucketing are disabled / 画像サイズが大きいのでface_crop_aug_rangeかrandom_crop、またはbucketを有効にしてください: {image_info.absolute_path}"
-                        if im_h > self.height:
-                            p = random.randint(0, im_h - self.height)
+                    else:
+                        ar = im_h / im_w
+                        if ar > 1.5:
+                            img = resize_shortest(img, 513)
+                        elif ar > 1:
+                            img = resize_longest(img, 769)
+                        else:
+                            img = resize_shortest(img, 769)
+                        sh, sw = img.shape[0:2]
+
+                        if sh > self.height:
+                            p = random.randint(
+                                int((sh - self.height) * 0), 
+                                int((sh - self.height) * 0.1))
                             img = img[p : p + self.height]
-                        if im_w > self.width:
-                            p = random.randint(0, im_w - self.width)
+                        if sw > self.width:
+                            p = random.randint(
+                                int((sw - self.width) * 0.4), 
+                                int((sw - self.width) * 0.6))
                             img = img[:, p : p + self.width]
 
                     im_h, im_w = img.shape[0:2]
                     assert (
                         im_h == self.height and im_w == self.width
-                    ), f"image size is small / 画像サイズが小さいようです: {image_info.absolute_path}"
+                    ), f"image size is small ({oh}, {ow}, {im_h}, {im_w}, {sh}, {sw}): {image_info.absolute_path}"
 
                 # augmentation
                 aug = self.aug_helper.get_augmentor(subset.color_aug, subset.flip_aug)
@@ -1097,53 +1170,36 @@ class DreamBoothDataset(BaseDataset):
 
             if len(self.caption_dict) == 0:
                 print("loading caption dict")
-                caption_path = os.path.join(subset.image_dir, '../image_captions.list')
+                caption_path = os.path.join(os.path.dirname(subset.image_dir), 'image_captions.list')
                 caption_dict = {}
                 with open(caption_path) as f:
                     for line in f:
                         a, b = line.split('\t', maxsplit=1)
-                        caption_dict[a] = b
+                        caption_dict['/'.join(a.split('/')[-2:])] = b
                 self.caption_dict = caption_dict
-                self.class2caption = {
-                    '虞书欣': 'yushuxing',
-                    '倪妮': 'nini',
-                    '万茜': 'wanqian',
-                    '刘耀文': 'liuyaowen',
-                    '娄艺潇': 'louyixiao',
-                    '孟美岐': 'mengmeiqi',
-                    '张国荣': 'zhangguorong',
-                    '李斯丹妮': 'lisidanni',
-                    '李荣浩': 'lironghao',
-                    '王子文': 'wangziwen',
-                    '王祖贤': 'wangzuxian',
-                    '谢霆锋': 'xietingfeng',
-                    '马嘉祺': 'majiaqi',
-                    '刘雨昕': 'liuyuxin'
-                }
             else:
                 caption_dict = self.caption_dict
             # 画像ファイルごとにプロンプトを読み込み、もしあればそちらを使う
             captions = []
             missing_captions = []
+            exists_img_paths = []
             for img_path in img_paths:
-                cap_for_img = read_caption(img_path, subset.caption_extension)
-                # if cap_for_img is None and subset.class_tokens is None:
-                #     print(
-                #         f"neither caption file nor class tokens are found. use empty caption for {img_path} / キャプションファイルもclass tokenも見つかりませんでした。空のキャプションを使用します: {img_path}"
-                #     )
-                #     captions.append("")
-                #     missing_captions.append(img_path)
-                # else:
                 key = '/'.join(img_path.split('/')[-2:])
-                # cap_for_img = self.class2caption[subset.class_tokens] + ', ' + caption_dict[key]
-                cap_for_img = caption_dict[key]
-                if cap_for_img is None:
-                    captions.append(subset.class_tokens)
-                    missing_captions.append(img_path)
-                else:
-                    captions.append(cap_for_img)
-            if len(captions) > 0:
-                print(img_path, cap_for_img)
+                if key in caption_dict:
+                    w, h = self.get_image_size(img_path)
+                    if w < 256 or h < 256:
+                        continue
+                    cap_for_img = caption_dict[key]
+                    if cap_for_img is None:
+                        captions.append(subset.class_tokens)
+                        missing_captions.append(img_path)
+                    else:
+                        captions.append(cap_for_img)
+                    exists_img_paths.append(img_path)
+
+            # if len(exists_img_paths) > 0:
+            #     print(key, list(caption_dict.keys())[:10])
+                # print(img_path, cap_for_img)
 
             self.set_tag_frequency(os.path.basename(subset.image_dir), captions)  # タグ頻度を記録
 
@@ -1160,7 +1216,7 @@ class DreamBoothDataset(BaseDataset):
                         print(missing_caption + f"... and {remaining_missing_captions} more")
                         break
                     print(missing_caption)
-            return img_paths, captions
+            return exists_img_paths, captions
 
         print("prepare images.")
         num_train_images = 0
@@ -1168,9 +1224,10 @@ class DreamBoothDataset(BaseDataset):
         reg_infos: List[ImageInfo] = []
 
         id_features = {}
-        ssf = SequenceFileReader(os.path.join(subsets[0].image_dir, '../result.list'))
-        for k, id_feature in zip(ssf.keys, parallel_imap(decode_feature, (ssf.read(k) for k in ssf.keys))):
-            k = '/'.join(k.split('/')[-3:]).replace('/已裁剪', '')
+        ssf = SequenceFileReader(os.path.join(os.path.dirname(subsets[0].image_dir), 'result.list'))
+        for k, id_feature in tqdm(zip(ssf.keys, parallel_imap(
+            decode_feature, (ssf.read(k) for k in ssf.keys)))):
+            k = '/'.join(k.split('/')[-2:])
             id_features[k] = id_feature
 
         for subset in subsets:
@@ -1552,7 +1609,7 @@ def glob_images(directory, base="*"):
     img_paths = []
     for ext in IMAGE_EXTENSIONS:
         if base == "*":
-            img_paths.extend(glob.glob(os.path.join(glob.escape(directory), base + ext)))
+            img_paths.extend(glob.glob(os.path.join(glob.escape(directory), '**', base + ext), recursive=True))
         else:
             img_paths.extend(glob.glob(glob.escape(os.path.join(directory, base + ext))))
     img_paths = list(set(img_paths))  # 重複を排除
@@ -3050,7 +3107,7 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
     if name == SchedulerType.POLYNOMIAL:
         return schedule_func(optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps, power=power)
 
-    return schedule_func(optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps)
+    return schedule_func(optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps, )
 
 
 def prepare_dataset_args(args: argparse.Namespace, support_metadata: bool):
@@ -3642,14 +3699,17 @@ def sample_images(
 
     rng_state = torch.get_rng_state()
     cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
-    ssf = SequenceFileReader("/mnt/lg104/zwshi/data/character/stars/processed/result.list")
+    ssf = SequenceFileReader("/mnt/2T/zwshi/data/characters/stars/crop_face/result.list")
 
     with torch.no_grad():
         with accelerator.autocast():
             for i, prompt in enumerate(prompts):
                 k, prompt = prompt.split('\t', maxsplit=1)
-                f = torch.FloatTensor(decode_feature(ssf.read(k)))[None, ...]
-                f = id_mlp(f.to(device))
+                f = torch.FloatTensor(decode_feature(ssf.read(k)))
+                pos_enc = torch.FloatTensor(encode_pos_scale([100, 100, 500, 500], 768, 512))
+                enc = torch.zeros([3, 512+192], dtype=torch.float32)
+                enc[0] = torch.cat([pos_enc, f])
+                f = id_mlp(enc.to(device))
                 if not accelerator.is_main_process:
                     continue
 

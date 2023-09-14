@@ -33,6 +33,7 @@ from library.custom_train_functions import (
     apply_noise_offset,
     scale_v_prediction_loss_like_noise_prediction,
 )
+from sbp.utils.functions import retry
 
 
 # TODO 他のスクリプトと共通化する
@@ -89,7 +90,7 @@ def train(args):
         args.seed = random.randint(0, 2**32)
     set_seed(args.seed)
 
-    tokenizer = train_util.load_tokenizer(args)
+    tokenizer = retry()(train_util.load_tokenizer)(args)
 
     # データセットを準備する
     if args.dataset_class is None:
@@ -166,7 +167,7 @@ def train(args):
 
     # モデルを読み込む
     from networks.mlp import ResMlp
-    id_mlp = ResMlp(num_layers=args.id_mlp_layers, num_hidden_states=768)
+    id_mlp = ResMlp(num_layers=args.id_mlp_layers, num_hidden_states=768, in_channel=704)
     text_encoder, vae, unet, _ = train_util.load_target_model(args, weight_dtype, accelerator)
 
     # モデルに xformers とか memory efficient attention を組み込む
@@ -654,8 +655,11 @@ def train(args):
                         input_ids = batch["input_ids"].to(accelerator.device)
                         encoder_hidden_states = train_util.get_hidden_states(args, input_ids, tokenizer, text_encoder, weight_dtype)
                         with torch.set_grad_enabled(True):
-                            encoder_id_features = id_mlp(batch['id_features'].to(accelerator.device))
-                            encoder_hidden_states = torch.cat([encoder_id_features[:, None, :], encoder_hidden_states], dim=1)
+                            id_features = batch['id_features'].to(accelerator.device)
+                            id_features = torch.reshape(id_features, (-1, 512 + 64 * 3))
+                            encoder_id_features = id_mlp(id_features)
+                            encoder_id_features = torch.reshape(encoder_id_features, (-1, 3, 768))
+                            encoder_hidden_states = torch.cat([encoder_id_features, encoder_hidden_states], dim=1)
                         # print("id:", encoder_id_features.norm(dim=-1, p=2))
                         # print("prompt:", encoder_hidden_states.norm(dim=-1, p=2))
 
@@ -807,7 +811,9 @@ def train(args):
     if is_main_process:
         ckpt_name = train_util.get_last_ckpt_name(args, "." + args.save_model_as)
         save_model(ckpt_name, network, global_step, num_train_epochs, force_sync_upload=True)
-
+        id_mlp_ckpt_path = os.path.join(args.output_dir, ckpt_name) + '_mlp.pt'
+        print("save:", id_mlp_ckpt_path)
+        torch.save(unwrap_model(id_mlp), id_mlp_ckpt_path)
         print("model saved.")
 
 

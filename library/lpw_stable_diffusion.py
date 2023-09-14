@@ -812,8 +812,9 @@ class StableDiffusionLongPromptWeightingPipeline(StableDiffusionPipeline):
         )
         dtype = text_embeddings.dtype
         if id_features is not None:
-            id_features = torch.cat([id_features for _ in range(text_embeddings.shape[0])], dim=0)
-            text_embeddings = torch.cat([id_features[:, None, :], text_embeddings], dim=1)
+            id_features = torch.stack([id_features for _ in range(text_embeddings.shape[0])], dim=0)
+            print(id_features.shape)
+            text_embeddings = torch.cat([id_features, text_embeddings], dim=1)
 
         # 4. Preprocess image and mask
         if isinstance(image, PIL.Image.Image):
