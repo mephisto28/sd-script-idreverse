@@ -1097,12 +1097,12 @@ class DreamBoothDataset(BaseDataset):
 
             if len(self.caption_dict) == 0:
                 print("loading caption dict")
-                caption_path = os.path.join(subset.image_dir, '../image_captions.list')
+                caption_path = os.path.join(os.path.dirname(subset.image_dir), 'image_captions.list')
                 caption_dict = {}
                 with open(caption_path) as f:
                     for line in f:
                         a, b = line.split('\t', maxsplit=1)
-                        caption_dict[a] = b
+                        caption_dict['/'.join(a.split('/')[-2:])] = b
                 self.caption_dict = caption_dict
                 self.class2caption = {
                     '虞书欣': 'yushuxing',
@@ -1170,7 +1170,7 @@ class DreamBoothDataset(BaseDataset):
         id_features = {}
         ssf = SequenceFileReader(os.path.join(subsets[0].image_dir, '../result.list'))
         for k, id_feature in zip(ssf.keys, parallel_imap(decode_feature, (ssf.read(k) for k in ssf.keys))):
-            k = '/'.join(k.split('/')[-3:]).replace('/已裁剪', '')
+            k = '/'.join(k.split('/')[-2:])
             id_features[k] = id_feature
 
         for subset in subsets:
@@ -1552,9 +1552,9 @@ def glob_images(directory, base="*"):
     img_paths = []
     for ext in IMAGE_EXTENSIONS:
         if base == "*":
-            img_paths.extend(glob.glob(os.path.join(glob.escape(directory), base + ext)))
+            img_paths.extend(glob.glob(os.path.join(glob.escape(directory), base + ext), recursive=True))
         else:
-            img_paths.extend(glob.glob(glob.escape(os.path.join(directory, base + ext))))
+            img_paths.extend(glob.glob(glob.escape(os.path.join(directory, base + ext)), recursive=True))
     img_paths = list(set(img_paths))  # 重複を排除
     img_paths.sort()
     return img_paths
