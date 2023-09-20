@@ -1136,12 +1136,13 @@ class DreamBoothDataset(BaseDataset):
                 # else:
                 key = '/'.join(img_path.split('/')[-2:])
                 # cap_for_img = self.class2caption[subset.class_tokens] + ', ' + caption_dict[key]
-                cap_for_img = caption_dict[key]
-                if cap_for_img is None:
-                    captions.append(subset.class_tokens)
-                    missing_captions.append(img_path)
-                else:
-                    captions.append(cap_for_img)
+                if key in caption_dict:
+                    cap_for_img = caption_dict[key]
+                    if cap_for_img is None:
+                        captions.append(subset.class_tokens)
+                        missing_captions.append(img_path)
+                    else:
+                        captions.append(cap_for_img)
             if len(captions) > 0:
                 print(img_path, cap_for_img)
 
