@@ -138,6 +138,13 @@ def encode_pos_scale(bbox, h, w):
     return np.array([x_enc, y_enc, s_enc]).flatten()
 
 
+def decode_feature_new(s):
+    result = ImageResult.from_json(json.loads(s))
+    face_results = result.get_detection('face', topk=3)
+    for i, face in enumerate(face_results):
+        face_feature = face.rec_feature
+        return face_feature.reshape([1, 512])
+
 def decode_feature_and_pos(s):
     result = ImageResult.from_json(json.loads(s))
     h, w = result.height, result.width
@@ -1175,7 +1182,8 @@ class DreamBoothDataset(BaseDataset):
                 with open(caption_path) as f:
                     for line in f:
                         a, b = line.split('\t', maxsplit=1)
-                        caption_dict['/'.join(a.split('/')[-2:])] = b
+                        split_start = [i for i, f in enumerate(a.split('/')) if f == 'RAW'][0] - 1
+                        caption_dict['/'.join(a.split('/')[split_start:])] = b
                 self.caption_dict = caption_dict
             else:
                 caption_dict = self.caption_dict
@@ -1183,12 +1191,13 @@ class DreamBoothDataset(BaseDataset):
             captions = []
             missing_captions = []
             exists_img_paths = []
-            for img_path in img_paths:
-                key = '/'.join(img_path.split('/')[-2:])
+            for img_path in tqdm(img_paths):
+                split_start = [i for i, f in enumerate(img_path.split('/')) if f == 'RAW'][0] - 1
+                key = '/'.join(img_path.split('/')[split_start:])
                 if key in caption_dict:
-                    w, h = self.get_image_size(img_path)
-                    if w < 256 or h < 256:
-                        continue
+                    # w, h = self.get_image_size(img_path)
+                    # if w < 256 or h < 256:
+                    #     continue
                     cap_for_img = caption_dict[key]
                     if cap_for_img is None:
                         captions.append(subset.class_tokens)
@@ -1197,6 +1206,7 @@ class DreamBoothDataset(BaseDataset):
                         captions.append(cap_for_img)
                     exists_img_paths.append(img_path)
 
+            print("caption nums: ", len(captions))
             # if len(exists_img_paths) > 0:
             #     print(key, list(caption_dict.keys())[:10])
                 # print(img_path, cap_for_img)
@@ -1226,8 +1236,10 @@ class DreamBoothDataset(BaseDataset):
         id_features = {}
         ssf = SequenceFileReader(os.path.join(os.path.dirname(subsets[0].image_dir), 'result.list'))
         for k, id_feature in tqdm(zip(ssf.keys, parallel_imap(
-            decode_feature, (ssf.read(k) for k in ssf.keys)))):
-            k = '/'.join(k.split('/')[-2:])
+            decode_feature_new, (ssf.read(k) for k in ssf.keys)))):
+            # k = '/'.join(k.split('/')[-2:])
+            split_start = [i for i, f in enumerate(k.split('/')) if f == 'RAW'][0] - 1
+            k = '/'.join(k.split('/')[split_start:])
             id_features[k] = id_feature
 
         for subset in subsets:
@@ -1254,7 +1266,8 @@ class DreamBoothDataset(BaseDataset):
                 num_train_images += subset.num_repeats * len(img_paths)
 
             for img_path, caption in zip(img_paths, captions):
-                key = '/'.join(img_path.split('/')[-2:])
+                split_start = [i for i, f in enumerate(img_path.split('/')) if f == 'RAW'][0] - 1
+                key = '/'.join(img_path.split('/')[split_start:])
                 if key in id_features:
                     info = ImageInfo(img_path, subset.num_repeats, caption, subset.is_reg, img_path, extra_feature=id_features[key])
                     if subset.is_reg:
@@ -3265,8 +3278,8 @@ def _load_target_model(args: argparse.Namespace, weight_dtype, device="cpu"):
 
     # VAEを読み込む
     if args.vae is not None:
+        print("loading vae")
         vae = model_util.load_vae(args.vae, weight_dtype)
-        print("additional VAE loaded")
 
     return text_encoder, vae, unet, load_stable_diffusion_format
 
@@ -3700,15 +3713,19 @@ def sample_images(
     rng_state = torch.get_rng_state()
     cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
     ssf = SequenceFileReader("/mnt/2T/zwshi/data/characters/stars/crop_face/result.list")
+    id_mlp_channel = 512
 
     with torch.no_grad():
         with accelerator.autocast():
             for i, prompt in enumerate(prompts):
                 k, prompt = prompt.split('\t', maxsplit=1)
                 f = torch.FloatTensor(decode_feature(ssf.read(k)))
-                pos_enc = torch.FloatTensor(encode_pos_scale([100, 100, 500, 500], 768, 512))
-                enc = torch.zeros([3, 512+192], dtype=torch.float32)
-                enc[0] = torch.cat([pos_enc, f])
+                if id_mlp_channel == 704:
+                    pos_enc = torch.FloatTensor(encode_pos_scale([100, 100, 500, 500], 768, 512))
+                    enc = torch.zeros([3, id_mlp_channel], dtype=torch.float32)
+                    enc[0] = torch.cat([pos_enc, f])
+                else:
+                    enc = torch.reshape(f, (1, 512))
                 f = id_mlp(enc.to(device))
                 if not accelerator.is_main_process:
                     continue

@@ -167,7 +167,8 @@ def train(args):
 
     # モデルを読み込む
     from networks.mlp import ResMlp
-    id_mlp = ResMlp(num_layers=args.id_mlp_layers, num_hidden_states=768, in_channel=704)
+    id_mlp_channel = 512
+    id_mlp = ResMlp(num_layers=args.id_mlp_layers, num_hidden_states=768, in_channel=id_mlp_channel)
     text_encoder, vae, unet, _ = train_util.load_target_model(args, weight_dtype, accelerator)
 
     # モデルに xformers とか memory efficient attention を組み込む
@@ -656,9 +657,10 @@ def train(args):
                         encoder_hidden_states = train_util.get_hidden_states(args, input_ids, tokenizer, text_encoder, weight_dtype)
                         with torch.set_grad_enabled(True):
                             id_features = batch['id_features'].to(accelerator.device)
-                            id_features = torch.reshape(id_features, (-1, 512 + 64 * 3))
+                            seq_len = id_features.shape[1]
+                            id_features = torch.reshape(id_features, (-1, id_mlp_channel))
                             encoder_id_features = id_mlp(id_features)
-                            encoder_id_features = torch.reshape(encoder_id_features, (-1, 3, 768))
+                            encoder_id_features = torch.reshape(encoder_id_features, (-1, seq_len, 768))
                             encoder_hidden_states = torch.cat([encoder_id_features, encoder_hidden_states], dim=1)
                         # print("id:", encoder_id_features.norm(dim=-1, p=2))
                         # print("prompt:", encoder_hidden_states.norm(dim=-1, p=2))
