@@ -153,8 +153,8 @@ class DreamBoothSsfDataset(BaseDataset):
             self.max_bucket_reso = None
             self.bucket_reso_steps = None  # この情報は使われない
             self.bucket_no_upscale = False
-        self.load_meta()
         self.feature_db = []
+        self.load_meta()
 
     def load_meta(self,):
         dataset_config = self.config
