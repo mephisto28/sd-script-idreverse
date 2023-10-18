@@ -133,7 +133,13 @@ def train(args):
                 }
 
         blueprint = blueprint_generator.generate(user_config, args, tokenizer=tokenizer)
-        train_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
+        # train_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
+        from library.ssf_dataset import DreamBoothSsfDataset
+        from library.train_util import DatasetGroup
+        dataset = DreamBoothSsfDataset("config.json", tokenizer, 221, False)
+        dataset.make_buckets()
+        dataset.set_seed(args.seed)
+        train_dataset_group = DatasetGroup([dataset])
     else:
         # use arbitrary dataset class
         train_dataset_group = train_util.load_arbitrary_dataset(args, tokenizer)
@@ -175,28 +181,30 @@ def train(args):
     train_util.replace_unet_modules(unet, args.mem_eff_attn, args.xformers)
 
     # 差分追加学習のためにモデルを読み込む
-    import sys
+    USE_LORA = True
+    if USE_LORA:
+        import sys
 
-    sys.path.append(os.path.dirname(__file__))
-    print("import network module:", args.network_module)
-    network_module = importlib.import_module(args.network_module)
+        sys.path.append(os.path.dirname(__file__))
+        print("import network module:", args.network_module)
+        network_module = importlib.import_module(args.network_module)
 
-    if args.base_weights is not None:
-        # base_weights が指定されている場合は、指定された重みを読み込みマージする
-        for i, weight_path in enumerate(args.base_weights):
-            if args.base_weights_multiplier is None or len(args.base_weights_multiplier) <= i:
-                multiplier = 1.0
-            else:
-                multiplier = args.base_weights_multiplier[i]
+        if args.base_weights is not None:
+            # base_weights が指定されている場合は、指定された重みを読み込みマージする
+            for i, weight_path in enumerate(args.base_weights):
+                if args.base_weights_multiplier is None or len(args.base_weights_multiplier) <= i:
+                    multiplier = 1.0
+                else:
+                    multiplier = args.base_weights_multiplier[i]
 
-            print(f"merging module: {weight_path} with multiplier {multiplier}")
+                print(f"merging module: {weight_path} with multiplier {multiplier}")
 
-            module, weights_sd = network_module.create_network_from_weights(
-                multiplier, weight_path, vae, text_encoder, unet, for_inference=True
-            )
-            module.merge_to(text_encoder, unet, weights_sd, weight_dtype, accelerator.device if args.lowram else "cpu")
+                module, weights_sd = network_module.create_network_from_weights(
+                    multiplier, weight_path, vae, text_encoder, unet, for_inference=True
+                )
+                module.merge_to(text_encoder, unet, weights_sd, weight_dtype, accelerator.device if args.lowram else "cpu")
 
-        print(f"all weights merged: {', '.join(args.base_weights)}")
+            print(f"all weights merged: {', '.join(args.base_weights)}")
 
     # 学習を準備する
     if cache_latents:
@@ -212,56 +220,61 @@ def train(args):
 
         accelerator.wait_for_everyone()
 
-    # prepare network
-    net_kwargs = {}
-    if args.network_args is not None:
-        for net_arg in args.network_args:
-            key, value = net_arg.split("=")
-            net_kwargs[key] = value
+    if USE_LORA:
+        # prepare network
+        net_kwargs = {}
+        if args.network_args is not None:
+            for net_arg in args.network_args:
+                key, value = net_arg.split("=")
+                net_kwargs[key] = value
 
-    # if a new network is added in future, add if ~ then blocks for each network (;'∀')
-    if args.dim_from_weights:
-        network, _ = network_module.create_network_from_weights(1, args.network_weights, vae, text_encoder, unet, **net_kwargs)
-    else:
-        # LyCORIS will work with this...
-        network = network_module.create_network(
-            1.0, args.network_dim, args.network_alpha, vae, text_encoder, unet, neuron_dropout=args.network_dropout, **net_kwargs
-        )
-    if network is None:
-        return
+        # if a new network is added in future, add if ~ then blocks for each network (;'∀')
+        if args.dim_from_weights:
+            network, _ = network_module.create_network_from_weights(1, args.network_weights, vae, text_encoder, unet, **net_kwargs)
+        else:
+            # LyCORIS will work with this...
+            network = network_module.create_network(
+                1.0, args.network_dim, args.network_alpha, vae, text_encoder, unet, neuron_dropout=args.network_dropout, **net_kwargs
+            )
+        if network is None:
+            return
 
-    if hasattr(network, "prepare_network"):
-        network.prepare_network(args)
-    if args.scale_weight_norms and not hasattr(network, "apply_max_norm_regularization"):
-        print(
-            "warning: scale_weight_norms is specified but the network does not support it / scale_weight_normsが指定されていますが、ネットワークが対応していません"
-        )
-        args.scale_weight_norms = False
+        if hasattr(network, "prepare_network"):
+            network.prepare_network(args)
+        if args.scale_weight_norms and not hasattr(network, "apply_max_norm_regularization"):
+            print(
+                "warning: scale_weight_norms is specified but the network does not support it / scale_weight_normsが指定されていますが、ネットワークが対応していません"
+            )
+            args.scale_weight_norms = False
 
-    train_unet = not args.network_train_text_encoder_only
-    train_text_encoder = not args.network_train_unet_only
-    network.apply_to(text_encoder, unet, train_text_encoder, train_unet)
+        train_unet = not args.network_train_text_encoder_only
+        train_text_encoder = not args.network_train_unet_only
+        network.apply_to(text_encoder, unet, train_text_encoder, train_unet)
 
-    if args.network_weights is not None:
-        info = network.load_weights(args.network_weights)
-        print(f"loaded network weights from {args.network_weights}: {info}")
+        if args.network_weights is not None:
+            info = network.load_weights(args.network_weights)
+            print(f"loaded network weights from {args.network_weights}: {info}")
 
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
         text_encoder.gradient_checkpointing_enable()
-        network.enable_gradient_checkpointing()  # may have no effect
+        # network.enable_gradient_checkpointing()  # may have no effect
 
     # 学習に必要なクラスを準備する
     print("preparing optimizer, data loader etc.")
 
     # 後方互換性を確保するよ
-    try:
-        trainable_params = network.prepare_optimizer_params(args.text_encoder_lr, args.unet_lr, args.learning_rate)
-    except TypeError:
-        print(
-            "Deprecated: use prepare_optimizer_params(text_encoder_lr, unet_lr, learning_rate) instead of prepare_optimizer_params(text_encoder_lr, unet_lr)"
-        )
-        trainable_params = network.prepare_optimizer_params(args.text_encoder_lr, args.unet_lr)
+    if USE_LORA:
+        try:
+            trainable_params = network.prepare_optimizer_params(args.text_encoder_lr, args.unet_lr, args.learning_rate)
+        except TypeError:
+            print(
+                "Deprecated: use prepare_optimizer_params(text_encoder_lr, unet_lr, learning_rate) instead of prepare_optimizer_params(text_encoder_lr, unet_lr)"
+            )
+            trainable_params = network.prepare_optimizer_params(args.text_encoder_lr, args.unet_lr)
+    else:
+        trainable_params = unet.parameters()
+
     import itertools
     trainable_params = itertools.chain(trainable_params, [{"params": id_mlp.parameters(), "lr": args.id_lr}])
     optimizer_name, optimizer_args, optimizer = train_util.get_optimizer(args, trainable_params)
@@ -302,6 +315,7 @@ def train(args):
         network.to(weight_dtype)
 
     # acceleratorがなんかよろしくやってくれるらしい
+    print("preparing everything ...")
     if train_unet and train_text_encoder:
         unet, text_encoder, network, id_mlp, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
             unet, text_encoder, network, id_mlp, optimizer, train_dataloader, lr_scheduler
@@ -319,8 +333,10 @@ def train(args):
 
     # transform DDP after prepare (train_network here only)
     text_encoder, unet, network, id_mlp = train_util.transform_if_model_is_DDP(text_encoder, unet, network, id_mlp)
+    print("preparing done.")
 
-    unet.requires_grad_(False)
+    if USE_LORA:
+        unet.requires_grad_(False)
     id_mlp.requires_grad_(True)
     unet.to(accelerator.device, dtype=weight_dtype)
     text_encoder.requires_grad_(False)
@@ -336,7 +352,8 @@ def train(args):
         unet.eval()
         text_encoder.eval()
 
-    network.prepare_grad_etc(text_encoder, unet)
+    if USE_LORA:
+        network.prepare_grad_etc(text_encoder, unet)
 
     if not cache_latents:  # キャッシュしない場合はVAEを使うのでVAEを準備する
         vae.requires_grad_(False)

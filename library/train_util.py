@@ -158,13 +158,13 @@ def decode_feature_and_pos(s):
 
 
 class ImageInfo:
-    def __init__(self, image_key: str, num_repeats: int, caption: str, is_reg: bool, absolute_path: str, extra_feature=None) -> None:
+    def __init__(self, image_key: str, num_repeats: int, caption: str, is_reg: bool, absolute_path: str, extra_feature=None, image_size=None) -> None:
         self.image_key: str = image_key
         self.num_repeats: int = num_repeats
         self.caption: str = caption
         self.is_reg: bool = is_reg
         self.absolute_path: str = absolute_path
-        self.image_size: Tuple[int, int] = None
+        self.image_size: Tuple[int, int] = image_size
         self.resized_size: Tuple[int, int] = None
         self.bucket_reso: Tuple[int, int] = None
         self.latents: torch.Tensor = None
@@ -677,11 +677,15 @@ class BaseDataset(torch.utils.data.Dataset):
         bucketingを行わない場合も呼び出し必須（ひとつだけbucketを作る）
         min_size and max_size are ignored when enable_bucket is False
         """
-        print("loading image sizes.")
-        sizes = list(tqdm(parallel_imap(
-            self.get_image_size, (info.absolute_path for info in self.image_data.values()), num_thread=8)))
-        for info, size in zip(self.image_data.values(), sizes):
-            info.image_size = size
+        key = list(self.image_data.keys())[0]
+        if self.image_data[key].image_size is None:
+            print("loading image sizes.")
+            sizes = list(tqdm(parallel_imap(
+                self.get_image_size, (info.absolute_path for info in self.image_data.values()), num_thread=8)))
+            for info, size in zip(self.image_data.values(), sizes):
+                info.image_size = size
+        else:
+            print("image size already loaded. continue")
 
         if self.enable_bucket:
             print("make buckets")
@@ -797,7 +801,7 @@ class BaseDataset(torch.utils.data.Dataset):
             image = image[:, p : p + reso[0]]
         if image_height > reso[1]:
             trim_size = image_height - reso[1]
-            p = trim_size // 2 if not subset.random_crop else random.randint(0, trim_size)
+            p = 0 if not subset.random_crop else random.randint(0, trim_size // 2)
             # print("h", trim_size, p)
             image = image[p : p + reso[1]]
 
@@ -835,29 +839,7 @@ class BaseDataset(torch.utils.data.Dataset):
                 continue
 
             # check disk cache exists and size of latents
-            if cache_to_disk:
-                # TODO: refactor to unify with FineTuningDataset
-                info.latents_npz = (os.path.splitext(info.absolute_path)[0] + ".npz").replace('prossessed_v2/', 'prossessed_v2/latents/')
-                info.latents_npz_flipped = (os.path.splitext(info.absolute_path)[0] + "_flip.npz").replace('prossessed_v2/', 'prossessed_v2/latents/')
-                if not is_main_process:
-                    continue
-
-                cache_available = False
-                expected_latents_size = (info.bucket_reso[1] // 8, info.bucket_reso[0] // 8)  # bucket_resoはWxHなので注意
-                if os.path.exists(info.latents_npz):
-                    cached_latents = np.load(info.latents_npz)["arr_0"]
-                    if cached_latents.shape[1:3] == expected_latents_size:
-                        cache_available = True
-
-                        if subset.flip_aug:
-                            cache_available = False
-                            if os.path.exists(info.latents_npz_flipped):
-                                cached_latents_flipped = np.load(info.latents_npz_flipped)["arr_0"]
-                                if cached_latents_flipped.shape[1:3] == expected_latents_size:
-                                    cache_available = True
-
-                if cache_available:
-                    continue
+            # Deleted
 
             # if last member of batch has different resolution, flush the batch
             if len(batch) > 0 and batch[-1].bucket_reso != info.bucket_reso:
@@ -873,9 +855,6 @@ class BaseDataset(torch.utils.data.Dataset):
 
         if len(batch) > 0:
             batches.append(batch)
-
-        if cache_to_disk and not is_main_process:  # don't cache latents in non-main process, set to info only
-            return
 
         # iterate batches
         for batch in tqdm(batches, smoothing=1, total=len(batches)):
@@ -909,8 +888,9 @@ class BaseDataset(torch.utils.data.Dataset):
                         info.latents_flipped = latent
 
     def get_image_size(self, image_path):
-        # image = Image.open(image_path)
-        return imagesize.get(image_path)
+        image = self.load_image(image_path)
+        h, w = image.shape[:2]
+        return w, h
 
     def load_image_with_face_info(self, subset: BaseSubset, image_path: str):
         img = self.load_image(image_path)
@@ -1182,7 +1162,8 @@ class DreamBoothDataset(BaseDataset):
                 with open(caption_path) as f:
                     for line in f:
                         a, b = line.split('\t', maxsplit=1)
-                        split_start = [i for i, f in enumerate(a.split('/')) if f == 'RAW'][0] - 1
+                        a = a.replace('.//', '').replace('./', '')
+                        split_start = -2 if not a.startswith('/') else [i for i, f in enumerate(a.split('/')) if f == 'RAW'][0] - 1
                         caption_dict['/'.join(a.split('/')[split_start:])] = b
                 self.caption_dict = caption_dict
             else:
@@ -1192,7 +1173,8 @@ class DreamBoothDataset(BaseDataset):
             missing_captions = []
             exists_img_paths = []
             for img_path in tqdm(img_paths):
-                split_start = [i for i, f in enumerate(img_path.split('/')) if f == 'RAW'][0] - 1
+                img_path = img_path.replace('.//', '').replace('./', '')
+                split_start = -1 if '.ssf' in img_path else -2 if 'RAW' not in img_path else  [i for i, f in enumerate(img_path.split('/')) if f == 'RAW'][0] - 1
                 key = '/'.join(img_path.split('/')[split_start:])
                 if key in caption_dict:
                     # w, h = self.get_image_size(img_path)
@@ -1204,6 +1186,9 @@ class DreamBoothDataset(BaseDataset):
                         missing_captions.append(img_path)
                     else:
                         captions.append(cap_for_img)
+                    exists_img_paths.append(img_path)
+                else:
+                    captions.append('a photo of a person')
                     exists_img_paths.append(img_path)
 
             print("caption nums: ", len(captions))
@@ -1238,7 +1223,8 @@ class DreamBoothDataset(BaseDataset):
         for k, id_feature in tqdm(zip(ssf.keys, parallel_imap(
             decode_feature_new, (ssf.read(k) for k in ssf.keys)))):
             # k = '/'.join(k.split('/')[-2:])
-            split_start = [i for i, f in enumerate(k.split('/')) if f == 'RAW'][0] - 1
+            k = k.replace('.//', '').replace('./', '')
+            split_start = -2 if not k.startswith('/') or 'RAW' not in k else  [i for i, f in enumerate(k.split('/')) if f == 'RAW'][0] - 1
             k = '/'.join(k.split('/')[split_start:])
             id_features[k] = id_feature
 
@@ -1266,7 +1252,7 @@ class DreamBoothDataset(BaseDataset):
                 num_train_images += subset.num_repeats * len(img_paths)
 
             for img_path, caption in zip(img_paths, captions):
-                split_start = [i for i, f in enumerate(img_path.split('/')) if f == 'RAW'][0] - 1
+                split_start = -1 if '.ssf' in img_path else  [i for i, f in enumerate(img_path.split('/')) if f == 'RAW'][0] - 1
                 key = '/'.join(img_path.split('/')[split_start:])
                 if key in id_features:
                     info = ImageInfo(img_path, subset.num_repeats, caption, subset.is_reg, img_path, extra_feature=id_features[key])
@@ -1304,6 +1290,7 @@ class DreamBoothDataset(BaseDataset):
                 first_loop = False
 
         self.num_reg_images = num_reg_images
+
 
 
 class FineTuningDataset(BaseDataset):
@@ -1533,9 +1520,9 @@ class DatasetGroup(torch.utils.data.ConcatDataset):
         for dataset in self.datasets:
             dataset.add_replacement(str_from, str_to)
 
-    # def make_buckets(self):
-    #   for dataset in self.datasets:
-    #     dataset.make_buckets()
+    def make_buckets(self):
+      for dataset in self.datasets:
+        dataset.make_buckets()
 
     def enable_XTI(self, *args, **kwargs):
         for dataset in self.datasets:
